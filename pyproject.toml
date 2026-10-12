@@ -266,6 +266,7 @@ forbidden_modules = [
     "everos.infra.persistence.lancedb.**",
     "everos.infra.persistence.sqlite.**",
     "everos.infra.persistence.index.**",
+    "everos.infra.persistence.records.**",
     "everos.infra.persistence.milvus.**",
     "everos.infra.persistence.backends.**",
 ]
@@ -284,11 +285,16 @@ forbidden_modules = [
 # (e.g. ``from everos.infra.persistence.sqlite.tables import X`` written
 # in ``service`` or ``entrypoints``) remain blocked — that edge is not
 # in this whitelist.
+#
+# One edge below is *not* intra-subpackage wiring: ``lancedb -> records``.
+# ``records/`` holds the table declarations every index backend reads
+# (TABLE_NAME / BM25_FIELDS / PRIMARY_KEY); it is the one shared schema
+# module inside ``persistence/`` (docs/architecture.md, dependency table).
 ignore_imports = [
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.tables",
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.repos",
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.sqlite_manager",
-    "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.tables",
+    "everos.infra.persistence.lancedb -> everos.infra.persistence.records",
     "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.repos",
     "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.lancedb_manager",
     "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.mds",
@@ -298,13 +304,16 @@ ignore_imports = [
     "everos.infra.persistence.index -> everos.infra.persistence.index.protocols",
     "everos.infra.persistence.index -> everos.infra.persistence.index.router",
     "everos.infra.persistence.index -> everos.infra.persistence.index.schema",
-    "everos.infra.persistence.index -> everos.infra.persistence.backends.lancedb",
-    "everos.infra.persistence.index -> everos.infra.persistence.backends.milvus",
+    # The facade and the router select the engine at call time; the Milvus
+    # import is function-level so pymilvus stays an optional extra, but the
+    # transitive scan still walks it.
+    "everos.infra.persistence.index -> everos.infra.persistence.milvus",
+    "everos.infra.persistence.index.router -> everos.infra.persistence.milvus",
 ]
 
 [[tool.importlinter.contracts]]
 # The facade and the router resolve a configured backend, so they import the
-# adapters by design. The port definitions must not: the moment protocols or
+# engine packages by design. The port definitions must not: the moment protocols or
 # schema knows a concrete engine, "portable" stops being checkable and the
 # next adapter inherits whatever leaked in. This is the rule that keeps the
 # split from eroding -- moving files alone does not stop anyone moving them
@@ -317,7 +326,6 @@ source_modules = [
     "everos.infra.persistence.predicate",
 ]
 forbidden_modules = [
-    "everos.infra.persistence.backends",
     "everos.infra.persistence.lancedb",
     "everos.infra.persistence.milvus",
     "everos.core.persistence.lancedb",

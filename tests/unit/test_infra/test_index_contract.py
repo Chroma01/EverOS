@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import os
 import re
 import subprocess
@@ -13,11 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from everos.infra.persistence.backends.lancedb import (
-    lance_index_backend,
-    render_predicate,
-)
-from everos.infra.persistence.backends.milvus import milvus_index_backend
 from everos.infra.persistence.index import (
     ALL_REPOS,
     All,
@@ -31,10 +27,13 @@ from everos.infra.persistence.index import (
     drop_business_tables,
     episode_repo,
     eq,
+    primary_key,
     shutdown,
 )
 from everos.infra.persistence.index.schema import IndexFieldKind, schema_for
-from everos.infra.persistence.lancedb import lancedb_manager
+from everos.infra.persistence.lancedb import index_backend as lance_index_backend
+from everos.infra.persistence.lancedb import lancedb_manager, render_predicate
+from everos.infra.persistence.milvus import index_backend as milvus_index_backend
 
 _EXTERNAL_PREFIX_PATTERN = re.compile(r"everos_e2e_[0-9a-f]{32}")
 
@@ -202,15 +201,15 @@ def test_lance_predicate_renderer_owns_escaping() -> None:
 @pytest.mark.parametrize(
     "module",
     [
-        "everos.infra.persistence.backends.lancedb",
-        "everos.infra.persistence.backends.milvus",
+        "everos.infra.persistence.lancedb",
+        "everos.infra.persistence.milvus",
         "everos.infra.persistence.index",
     ],
 )
 def test_adapter_and_port_modules_import_in_any_order(module: str) -> None:
     """Each module must import as the process's first everos import.
 
-    The port facade wires the concrete backends at import time, so an adapter
+    The port facade wires the engine packages at import time, so an engine
     reaching back into the ``index`` package closes a cycle: whichever side is
     imported first fails on a partially initialised module. A subprocess is the
     only honest check — inside this process the package is already imported, so
@@ -265,7 +264,9 @@ async def test_repository_port_crud_count_and_uncapped_scan(
         {"subject": "updated"},
         where=eq("id", rows[0].id),
     )
-    updated = await episode_repo.get_by_id(rows[0].id)
+    updated = await episode_repo.find_one_where(
+        primary_key(rows[0].app_id, rows[0].project_id, rows[0].id)
+    )
     assert updated is not None and updated.subject == "updated"
 
     await episode_repo.delete(eq("id", rows[0].id))
@@ -279,3 +280,20 @@ async def test_repository_maintenance_contract_is_executable(
     await episode_repo.optimize()
     await episode_repo.prune(dt.timedelta(days=7))
     await episode_repo.rebuild_indexes()
+
+
+def test_contract_has_no_way_around_the_primary_key() -> None:
+    """The only write is a merge on the declared key: no `by`, no plain insert."""
+    assert "by" not in inspect.signature(IndexRepository.upsert).parameters
+    assert not hasattr(IndexRepository, "add")
+    assert not hasattr(IndexRepository, "get_by_id")
+    for repo in ALL_REPOS:
+        assert not hasattr(repo, "add"), repo.table_name
+        assert not hasattr(repo, "get_by_id"), repo.table_name
+
+
+def test_primary_key_predicate_renders_three_equalities() -> None:
+    rendered = render_predicate(primary_key("claude-code", "alpha", "u1_ep_1"))
+    assert rendered == (
+        "((app_id = 'claude-code') AND (project_id = 'alpha') AND (id = 'u1_ep_1'))"
+    )

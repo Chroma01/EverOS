@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import enum
 import os
+from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -223,6 +224,19 @@ def _build_orchestrator() -> CascadeOrchestrator:
     )
 
 
+async def _drain_fully(orchestrator: CascadeOrchestrator) -> int:
+    """One scan, then drain until a pass processes nothing.
+
+    The worker bounds a single drain (``max_passes`` × batch size); the
+    ledger the one-time reconcile queues after an upgrade can exceed it,
+    and the command must not report success with rows still pending.
+    """
+    processed = await orchestrator.sync_once()
+    while more := await orchestrator.drain_once():
+        processed += more
+    return processed
+
+
 # ── sync ─────────────────────────────────────────────────────────────────
 
 
@@ -243,6 +257,16 @@ def sync(
         bool | None,
         typer.Option("--verbose", "-v", help=_VERBOSE_OPTION_HELP),
     ] = None,
+    force_all: Annotated[
+        bool,
+        typer.Option(
+            "--force-all",
+            help="Force-enqueue every indexed md before draining; entries whose "
+            "rows are present and unchanged are skipped by the handlers, so "
+            "only lost or edited entries get re-embedded. The first full pass "
+            "after upgrading from a release before 1.4.2 does this by itself.",
+        ),
+    ] = False,
 ) -> None:
     """Drain the cascade queue (and optionally re-enqueue a path first).
 
@@ -256,9 +280,20 @@ def sync(
     _apply_root_env(root)
     _apply_verbose_logging(verbose)
 
+    if force_all and path is not None:
+        raise typer.BadParameter("--force-all re-enqueues every md; do not pass PATH")
+
     async def _run() -> None:
         async with _runtime(exclusive=True):
             orchestrator = _build_orchestrator()
+            if force_all:
+                rows = await orchestrator.force_enqueue_all()
+                by_status = Counter(row.status for row in rows)
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(by_status.items()))
+                typer.echo(
+                    f"force-enqueued {len(rows)} md file(s)"
+                    + (f": {summary}" if summary else "")
+                )
             if path is not None:
                 rel = _resolve_relative(path)
                 spec = match_kind(rel)
@@ -271,7 +306,7 @@ def sync(
                     raise typer.Exit(code=1)
                 await md_change_state_repo.force_enqueue(rel, spec.name)
                 typer.echo(f"force-enqueued {rel} (kind={spec.name})")
-            processed = await orchestrator.sync_once()
+            processed = await _drain_fully(orchestrator)
             typer.echo(f"sync complete — processed {processed} row(s)")
 
     asyncio.run(_run())
@@ -550,7 +585,7 @@ def rebuild(
             await ensure_business_indexes()
             # Re-scan + drain: re-embed and re-insert every md entry.
             orchestrator = _build_orchestrator()
-            processed = await orchestrator.sync_once()
+            processed = await _drain_fully(orchestrator)
             typer.echo(f"rebuild complete — re-indexed {processed} md file(s)")
 
     try:

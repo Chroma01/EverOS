@@ -26,32 +26,33 @@ first access; row population is the cascade daemon's job (see
 
 import contextlib
 import datetime as dt
+from typing import Any, ClassVar
 
 from everos.core.observability.logging import get_logger
 from everos.core.persistence import BaseLanceTable, MemoryRoot, memory_root_lock
 
-# Importing ``tables`` registers every business :class:`BaseLanceTable`
-# schema so callers can rely on the package alone to surface every schema.
-from . import tables as tables
+from ..records import AgentCase as AgentCase
+from ..records import AgentSkill as AgentSkill
+from ..records import AtomicFact as AtomicFact
+from ..records import Episode as Episode
+from ..records import Foresight as Foresight
+from ..records import KnowledgeTopic as KnowledgeTopic
+from ..records import ParentType as ParentType
+from ..records import UserProfile as UserProfile
 from .lancedb_manager import dispose_connection as dispose_connection
 from .lancedb_manager import drop_tables as _drop_tables
 from .lancedb_manager import get_connection as get_connection
 from .lancedb_manager import get_table as get_table
+from .repos import LanceIndexContract as LanceIndexContract
 from .repos import agent_case_repo as agent_case_repo
 from .repos import agent_skill_repo as agent_skill_repo
 from .repos import atomic_fact_repo as atomic_fact_repo
+from .repos import build_or_query as build_or_query
 from .repos import episode_repo as episode_repo
 from .repos import foresight_repo as foresight_repo
 from .repos import knowledge_topic_repo as knowledge_topic_repo
+from .repos import render_predicate as render_predicate
 from .repos import user_profile_repo as user_profile_repo
-from .tables import AgentCase as AgentCase
-from .tables import AgentSkill as AgentSkill
-from .tables import AtomicFact as AtomicFact
-from .tables import Episode as Episode
-from .tables import Foresight as Foresight
-from .tables import KnowledgeTopic as KnowledgeTopic
-from .tables import ParentType as ParentType
-from .tables import UserProfile as UserProfile
 
 _BUSINESS_SCHEMAS = (
     Episode,
@@ -281,6 +282,9 @@ async def migrate_table_schemas() -> None:
         logger.info("table_schema_migration_done", version=_TABLE_SCHEMA_VERSION)
 
 
+# TODO(#477): BTree scalar index on `id` for the business tables — a 4x win on
+# keyed lookups at 100k rows, but it must join rebuild_indexes() and
+# `cascade rebuild` first and be soaked for index-directory growth.
 async def ensure_business_indexes() -> None:
     """Ensure FTS (BM25) indexes for every business table (idempotent).
 
@@ -385,7 +389,53 @@ async def drop_business_tables() -> list[str]:
     return await _drop_tables([schema.TABLE_NAME for schema in _BUSINESS_SCHEMAS])
 
 
+ALL_REPOS = (
+    episode_repo,
+    atomic_fact_repo,
+    foresight_repo,
+    agent_case_repo,
+    agent_skill_repo,
+    user_profile_repo,
+    knowledge_topic_repo,
+)
+
+
+class LanceIndexBackend:
+    """Own LanceDB connection, schema, index, and repository lifecycle.
+
+    The ``IndexBackend`` port the ``everos.infra.persistence.index`` facade
+    selects when ``index.backend`` is ``"lancedb"``.
+    """
+
+    name: ClassVar[str] = "lancedb"
+    repositories = ALL_REPOS
+
+    async def connect(self) -> Any:
+        return await get_connection()
+
+    async def startup(self) -> Any:
+        connection = await self.connect()
+        await self.verify_business_schemas()
+        await self.ensure_business_indexes()
+        return connection
+
+    async def shutdown(self) -> None:
+        await dispose_connection()
+
+    async def ensure_business_indexes(self) -> None:
+        await ensure_business_indexes()
+
+    async def verify_business_schemas(self) -> None:
+        await verify_business_schemas()
+
+    async def drop_business_tables(self) -> list[str]:
+        return await drop_business_tables()
+
+
+index_backend = LanceIndexBackend()
+
 __all__ = [
+    "ALL_REPOS",
     "BUSINESS_SCHEMAS_WITH_VECTOR",
     "AgentCase",
     "AgentSkill",
@@ -395,11 +445,14 @@ __all__ = [
     "KnowledgeTopic",
     "LanceDBMigrationError",
     "LanceDBSchemaMismatchError",
+    "LanceIndexBackend",
+    "LanceIndexContract",
     "ParentType",
     "UserProfile",
     "agent_case_repo",
     "agent_skill_repo",
     "atomic_fact_repo",
+    "build_or_query",
     "dispose_connection",
     "drop_business_tables",
     "ensure_business_indexes",
@@ -407,9 +460,11 @@ __all__ = [
     "foresight_repo",
     "get_connection",
     "get_table",
+    "index_backend",
     "knowledge_topic_repo",
     "migrate_fts_indexes",
     "migrate_table_schemas",
+    "render_predicate",
     "user_profile_repo",
     "verify_business_schemas",
 ]

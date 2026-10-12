@@ -99,6 +99,7 @@ class _MdChangeStateRepo(RepoBase[MdChangeState]):
         kind: str,
         change_type: str,
         mtime: float,
+        reset_retry_count: bool = False,
     ) -> int:
         """Enqueue or re-enqueue ``md_path``; return the assigned LSN.
 
@@ -115,6 +116,9 @@ class _MdChangeStateRepo(RepoBase[MdChangeState]):
           mtime is unchanged (scanner auto-retry), ``retry_count``
           carries over so the worker can enforce a total retry budget;
           otherwise it resets to 0 (new content deserves a fresh start).
+          ``reset_retry_count=True`` resets it regardless — a forced
+          re-enqueue must reach the handler even when the budget was
+          spent.
 
         The fresh LSN on re-enqueue is the property that lets the worker
         rely on ``ORDER BY lsn`` for ordering without losing fairness
@@ -153,7 +157,9 @@ class _MdChangeStateRepo(RepoBase[MdChangeState]):
                         "retryable": None,
                         "last_attempt_at": None,
                         "error": None,
-                        "retry_count": text(
+                        "retry_count": 0
+                        if reset_retry_count
+                        else text(
                             "CASE"
                             " WHEN md_change_state.status = 'failed'"
                             " AND ABS(md_change_state.mtime - :new_mtime)"
@@ -169,19 +175,43 @@ class _MdChangeStateRepo(RepoBase[MdChangeState]):
             await s.commit()
             return new_lsn
 
-    async def force_enqueue(self, md_path: str, kind: str) -> int:
+    async def force_enqueue(
+        self, md_path: str, kind: str, *, mtime: float = 0.0
+    ) -> int:
         """`cascade sync --path` entry: re-enqueue regardless of status.
 
         Semantically the same as :meth:`upsert` with ``change_type
         ='modified'``; named separately because the CLI flow has no
-        watcher / scanner event to attribute the row to.
+        watcher / scanner event to attribute the row to. A caller that
+        has the row's recorded ``mtime`` passes it on, so the scanner does
+        not see a changed mtime and queue the file a second time. The
+        retry budget always restarts: the point of forcing is that the
+        handler runs, including on a row whose budget was spent.
         """
         return await self.upsert(
             md_path,
             kind=kind,
             change_type="modified",
-            mtime=0.0,
+            mtime=mtime,
+            reset_retry_count=True,
         )
+
+    async def force_enqueue_all(self) -> list[MdChangeState]:
+        """Re-enqueue every row the ledger knows about; return the rows as
+        they were before, oldest LSN first.
+
+        Drives ``cascade sync --force-all`` and the one-time index
+        reconcile at startup: the handlers re-reconcile each md against
+        the index, so a file whose rows are present and unchanged costs
+        no embedding while a file whose rows were lost comes back. No
+        status filter on purpose — ``failed`` rows must come back too.
+        """
+        rows = await self.list_all()
+        # ponytail: one upsert (one commit) per file; batch into a single
+        # session if a root with tens of thousands of md files makes startup wait.
+        for row in rows:
+            await self.force_enqueue(row.md_path, row.kind, mtime=row.mtime)
+        return rows
 
     # ── Worker claim ───────────────────────────────────────────────────────
 
@@ -386,6 +416,19 @@ class _MdChangeStateRepo(RepoBase[MdChangeState]):
                         .order_by(MdChangeState.lsn)
                     )
                 )
+                .scalars()
+                .all()
+            )
+            return list(rows)
+
+    async def list_all(self) -> list[MdChangeState]:
+        """Return every row regardless of status, oldest LSN first.
+
+        Backs :meth:`force_enqueue_all`; no status filter on purpose.
+        """
+        async with session_scope(self._factory) as s:
+            rows = (
+                (await s.execute(select(MdChangeState).order_by(MdChangeState.lsn)))
                 .scalars()
                 .all()
             )

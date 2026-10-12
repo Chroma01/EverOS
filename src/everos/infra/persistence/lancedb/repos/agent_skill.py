@@ -9,11 +9,12 @@ from lancedb import AsyncTable
 from everos.core.persistence.lancedb import LanceRepoBase
 from everos.core.persistence.lancedb.base import VECTOR_QUERY_NPROBES
 
+from ...records.agent_skill import AgentSkill
 from ..lancedb_manager import get_table
-from ..tables.agent_skill import AgentSkill
+from ._contract import LanceIndexContract
 
 
-class _AgentSkillRepo(LanceRepoBase[AgentSkill]):
+class _AgentSkillRepo(LanceIndexContract[AgentSkill], LanceRepoBase[AgentSkill]):
     schema = AgentSkill
 
     async def _table_lookup(self) -> AsyncTable:
