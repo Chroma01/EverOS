@@ -28,7 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.index/.index_reconcile_version`. Entries whose rows are present and
   unchanged are skipped by digest, so a healthy root pays one read pass
   and no embedding; only the rows that were lost are re-embedded.
-  `everos cascade sync --force-all` runs the same pass on demand.
+  `everos cascade sync --force-all` runs the same pass on demand. Two
+  roots need that command instead: a server started with
+  `EVEROS_DISABLE_CASCADE=1` never runs the pass (stop it and run
+  `everos cascade sync --force-all` once), and a multi-project root where
+  reflection ran before this release needs `everos cascade rebuild` once,
+  because the pass does not clear the `deprecated_by` stamps one project's
+  reflection left on another project's rows.
+
+- **`POST /cascade/quiesce` freezes a complete index.** Its drain stopped
+  at the worker's per-drain bound, and inside a server it could also stop
+  while the background worker still held the last batch, which the stop
+  that follows then orphaned in `processing`; the ledger an upgrade
+  re-queues made both routine. The drain now runs until the ledger holds
+  nothing pending, waiting for the worker's in-flight batch, and
+  `everos cascade sync` / `rebuild` use the same loop.
 
 - **Changing a knowledge document's category keeps it inside `knowledge/`.**
   `PATCH /knowledge/documents/{doc_id}` with `category_id` set to `..` moved
