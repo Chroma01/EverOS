@@ -363,6 +363,7 @@ class EmbeddingSettings(BaseModel):
         EVEROS_EMBEDDING__MAX_RETRIES
         EVEROS_EMBEDDING__BATCH_SIZE
         EVEROS_EMBEDDING__MAX_CONCURRENT
+        EVEROS_EMBEDDING__QUERY_MAX_CONCURRENT
     """
 
     model: str | None = None
@@ -378,6 +379,16 @@ class EmbeddingSettings(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     batch_size: int = Field(default=10, ge=1)
     max_concurrent: int = Field(default=10, ge=1)
+    query_max_concurrent: int = Field(default=4, ge=1)
+    """Concurrency budget reserved for interactive query embeds, separate
+    from ``max_concurrent``, which the cascade's background writes draw on.
+
+    Sharing one budget means a burst of writes queues ahead of the query a
+    user is waiting on. Measured under three concurrent writers: vector
+    search p50 48 s on the shared budget, against 0.49 s for the keyword
+    leg, which needs no embedding at all (issue #473). Total in-flight
+    requests to the endpoint are ``max_concurrent + query_max_concurrent``;
+    lower this if the endpoint is rate-limited."""
 
 
 class RerankSettings(BaseModel):
@@ -510,14 +521,52 @@ class LanceDBSettings(BaseModel):
       indexes) or if you hit a tighter ``ulimit -n`` (containers / dev
       boxes).
 
-      Note: the *metadata* cache (``metadata_cache_size_bytes``) is
-      **not** exposed — experiment showed it caches in-memory parsed
-      manifests / fragment stats with zero impact on FD count; leaving
-      it unbounded (lancedb default) is fine.
+    ``metadata_cache_size_bytes``:
+      Upper bound on LanceDB's session metadata cache. An earlier note here
+      said this cache was free of FD pressure and could stay unbounded. That
+      was wrong, and it is the setting that actually decides whether a
+      long-running writer's descriptor count converges.
+
+      Lance keys these entries by dataset *version* (``ManifestKey{version}``),
+      so every commit inserts new ones, and ``cleanup`` deleting the files
+      underneath does not evict them — upstream ``lance-format/lance#7718``.
+      Each surviving entry keeps its index reader, and the reader keeps the
+      descriptors of its ``_indices/<uuid>/`` files, which POSIX will not
+      release on unlink.
+
+      **This setting chooses where the descriptor count converges.** It is
+      not a capacity knob. Descriptors track surviving cache entries, not
+      bytes, so the plateau lands at roughly
+      ``cap / bytes-per-entry x handles-per-entry``: quadruple the cap and
+      the plateau quadruples with it, it just takes proportionally longer
+      to get there. Measured on 7 tables with the index cache at 16 MB,
+      counting one descriptor per numeric ``lsof`` row:
+
+      ===============  =============  ==========================
+      metadata cap     converges at   reached by
+      ===============  =============  ==========================
+      ``1 MB``         ~216           round 31          ← default
+      ``4 MB``         814            round 125
+      unbounded        never          607 and climbing at 80
+      ===============  =============  ==========================
+
+      So size it from the descriptor ceiling you can afford, not from how
+      much room the cache "needs". 1 MB leaves roughly 4x headroom under
+      Linux's default ``ulimit -n`` of 1024. Raising it for a deployment
+      whose manifests genuinely do not fit means raising ``ulimit -n`` by
+      the same factor.
+
+      Query latency was flat across every cap tried (BM25 2.0-2.9 ms,
+      vector 3.9-4.5 ms at equal data volume), so the tight cap costs
+      nothing measurable — the thrash this note used to predict did not
+      appear. Not measured: a corpus of tens of GB per table, or object
+      storage, where a miss is a network round trip rather than a local
+      read.
     """
 
     read_consistency_seconds: float | None = None
     index_cache_size_bytes: int = 16 * 1024 * 1024
+    metadata_cache_size_bytes: int = 1024 * 1024
     vector_index_min_rows: int = Field(default=2000, ge=1)
     """Rows (with a non-null vector) a table needs before its vector columns
     get an ANN index. Below this a brute-force scan is cheaper than the
