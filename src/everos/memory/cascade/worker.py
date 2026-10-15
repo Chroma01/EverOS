@@ -26,9 +26,10 @@ this batch's inline retries) is short-circuited straight to
 bounds the total retry budget so a persistently-failing row cannot
 retry forever.
 
-Batch processing is concurrent inside a batch (``asyncio.gather``);
-ordering across rows is best-effort — the LSN gives a deterministic
-prefix but the handlers themselves are independent.
+Batch processing is bounded-concurrent inside a batch; rows are claimed in
+batches of 50 but only a small fixed number of handlers execute at once.
+Ordering across rows is best-effort — the LSN gives a deterministic prefix
+but the handlers themselves are independent.
 
 After a batch completes, each kind that mutated its LanceDB table is
 passed to :meth:`_schedule_optimize` — a per-kind throttle + trailing
@@ -73,6 +74,30 @@ logger = get_logger(__name__)
 
 # Conservative defaults — surface in settings if tuning is needed.
 DEFAULT_BATCH_SIZE = 50
+DEFAULT_HANDLER_CONCURRENCY = 4
+"""Maximum handler executions in flight on one worker.
+
+The bound is per worker, not per :meth:`CascadeWorker.drain_once` call: a
+server drains from two places at once -- the background loop and whatever
+calls ``drain_fully`` (``POST /cascade/quiesce`` does, before ``stop``) --
+and a semaphore built per call would let those two overlap at twice this
+number, in exactly the backlog-plus-quiesce case the bound exists for.
+
+A daily-log handler first resolves existing rows by ``md_path``. On fragmented
+Lance tables that lookup is a native flat scan: 50 simultaneous handlers grew
+the production-data replay past 8.29 GiB and did not finish in 80 seconds,
+while 1/2/4/8-way peaks were about 0.26/0.61/0.98/1.73 GiB. Keeping the claim
+batch at 50 preserves queue semantics; bounding only execution prevents native
+queries that outlive Python cancellation from multiplying memory and file
+handles after a timeout.
+
+A slot is held across :meth:`_process_one`, inline retry backoff included, so
+a row failing against a down provider parks one slot for
+``retry_backoff * max_retry * (max_retry + 1) / 2`` seconds (12s at the
+defaults) with no native query in flight. That is deliberate -- backing off
+harder against a provider that is already failing is the behaviour we want --
+but it is why a fully-failing batch drains slower than it did unbounded.
+"""
 DEFAULT_MAX_RETRY = 3
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
@@ -450,6 +475,7 @@ class CascadeWorker:
         handlers: dict[str, Handler],
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        handler_concurrency: int = DEFAULT_HANDLER_CONCURRENCY,
         max_retry: int = DEFAULT_MAX_RETRY,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
@@ -465,8 +491,12 @@ class CascadeWorker:
             DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS
         ),
     ) -> None:
+        if handler_concurrency <= 0:
+            raise ValueError("handler_concurrency must be positive")
         self._handlers = handlers
         self._batch_size = batch_size
+        self._handler_concurrency = handler_concurrency
+        self._handler_semaphore = asyncio.Semaphore(handler_concurrency)
         self._max_retry = max_retry
         self._poll_interval = poll_interval_seconds
         self._retry_backoff = retry_backoff_seconds
@@ -497,7 +527,11 @@ class CascadeWorker:
         self._rebuild_task = self._spawn_loop(
             "rebuild", self._rebuild_loop, "cascade-worker-rebuild"
         )
-        logger.info("cascade_worker_started", batch_size=self._batch_size)
+        logger.info(
+            "cascade_worker_started",
+            batch_size=self._batch_size,
+            handler_concurrency=self._handler_concurrency,
+        )
 
     def _spawn_loop(
         self,
@@ -655,7 +689,12 @@ class CascadeWorker:
         )
         if not batch:
             return 0
-        results = await asyncio.gather(*(self._process_one(row) for row in batch))
+
+        async def process_bounded(row: MdChangeState) -> str | None:
+            async with self._handler_semaphore:
+                return await self._process_one(row)
+
+        results = await asyncio.gather(*(process_bounded(row) for row in batch))
         touched_kinds = {kind for kind in results if kind is not None}
         for kind in touched_kinds:
             self._schedule_optimize(kind)
