@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, ClassVar
 
+import pyarrow as pa
 from lancedb import AsyncTable
 
 from everos.component.utils.datetime import get_utc_now
@@ -767,6 +768,7 @@ class LanceRepoBase[T: BaseLanceTable]:
         where: str,
         *,
         limit: int = 100,
+        skip_vectors: bool = False,
     ) -> list[T]:
         """Scalar query returning *typed* schema instances.
 
@@ -774,10 +776,24 @@ class LanceRepoBase[T: BaseLanceTable]:
         LanceDB row dicts. No vector ANN; pure scalar filter only.
         Use :meth:`search` when you need ``_distance`` or want to mix
         ANN with filters.
+
+        ``skip_vectors``: leave the vector columns out of the
+        read; they come back as ``None``. Each 1024-D vector becomes 1024
+        Python floats in ``to_list``, so bulk readers that never use them
+        should set this.
         """
         async with self._deadline(_READ_TIMEOUT_SECONDS, "find_where"):
             table = await self._table()
-            rows = await table.query().where(where).limit(limit).to_list()
+            query = table.query().where(where)
+            if skip_vectors:
+                query = query.select(
+                    [
+                        f.name
+                        for f in self.schema.to_arrow_schema()
+                        if not pa.types.is_fixed_size_list(f.type)
+                    ]
+                )
+            rows = await query.limit(limit).to_list()
         return [self.schema.model_validate(r) for r in rows]
 
     async def find_one_where(self, where: str) -> T | None:
@@ -971,6 +987,7 @@ class LanceDailyLogRepoBase[T: BaseLanceTable](LanceRepoBase[T]):
         *,
         app_id: str = "default",
         project_id: str = "default",
+        skip_vectors: bool = False,
     ) -> list[T]:
         """Bulk point-query by ``(app, project, owner_id, entry_id IN ...)``.
 
@@ -979,15 +996,48 @@ class LanceDailyLogRepoBase[T: BaseLanceTable](LanceRepoBase[T]):
         tuples). The query's ``limit`` is bound to ``len(entry_ids)``
         because at most one row per id can exist under one (app, project,
         owner) scope.
+
+        ``skip_vectors`` leaves the vector columns out of the read (see
+        :meth:`find_where`). A free-form ``columns`` projection is the
+        index contract's concern, not the chassis': it returns raw dicts
+        rather than ``T``, so it lives on ``LanceIndexContract``, which
+        overrides this method and calls :meth:`project_rows` for it.
         """
         if not entry_ids:
             return []
         quoted = ", ".join(f"'{_q(eid)}'" for eid in entry_ids)
-        return await self.find_where(
+        where = (
             f"owner_id = '{_q(owner_id)}' AND entry_id IN ({quoted}) "
-            f"AND app_id = '{_q(app_id)}' AND project_id = '{_q(project_id)}'",
-            limit=len(entry_ids),
+            f"AND app_id = '{_q(app_id)}' AND project_id = '{_q(project_id)}'"
         )
+        return await self.find_where(
+            where, limit=len(entry_ids), skip_vectors=skip_vectors
+        )
+
+    async def project_rows(
+        self, where: str, columns: Sequence[str], *, limit: int
+    ) -> list[dict[str, Any]]:
+        """Read ``columns`` only, as raw dicts, under the read deadline.
+
+        The projection is pushed into ``select()`` so the unread columns --
+        a 1024-D vector is the one that matters -- are never read off disk.
+        Returns dicts rather than ``T`` because a projected row cannot
+        satisfy the schema's required fields.
+
+        Callers that already hold a :class:`Predicate` render it first. This
+        lives here rather than beside those callers so that every read in
+        this class is covered by :data:`_READ_TIMEOUT_SECONDS`; the
+        docstring there explains what an uncovered hung read costs.
+        """
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "find_where"):
+            table = await self._table()
+            return (
+                await table.query()
+                .where(where)
+                .select(list(columns))
+                .limit(limit)
+                .to_list()
+            )
 
     async def find_by_session(
         self,

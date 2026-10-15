@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Sequence
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, overload, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -41,7 +41,9 @@ class IndexRepository(Protocol[T]):
 
     async def count_where(self, where: Predicate | None = None) -> int: ...
 
-    async def find_where(self, where: Predicate, *, limit: int = 100) -> list[T]: ...
+    async def find_where(
+        self, where: Predicate, *, limit: int = 100, skip_vectors: bool = False
+    ) -> list[T]: ...
 
     async def find_one_where(self, where: Predicate) -> T | None: ...
 
@@ -58,6 +60,7 @@ class IndexRepository(Protocol[T]):
         project_id: str = "default",
     ) -> T | None: ...
 
+    @overload
     async def find_by_owner_entries(
         self,
         owner_id: str,
@@ -65,7 +68,32 @@ class IndexRepository(Protocol[T]):
         *,
         app_id: str = "default",
         project_id: str = "default",
+        columns: None = None,
+        skip_vectors: bool = False,
     ) -> list[T]: ...
+
+    @overload
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str],
+        skip_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str] | None = None,
+        skip_vectors: bool = False,
+    ) -> list[T] | list[dict[str, Any]]: ...
 
     async def find_by_session(
         self, owner_id: str, session_id: str, *, limit: int = 100

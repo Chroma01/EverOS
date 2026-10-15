@@ -6,7 +6,7 @@ import asyncio
 import datetime as dt
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, overload
 
 from pydantic import BaseModel
 from pymilvus import DataType, Function, FunctionType, MilvusClient
@@ -510,8 +510,12 @@ class MilvusRepoBase[T: BaseModel]:
         )
         return int(rows[0].get("count(*)", 0)) if rows else 0
 
-    async def find_where(self, where: Predicate, *, limit: int = 100) -> list[T]:
-        rows = await self._query_raw(where, limit=limit, include_vectors=True)
+    async def find_where(
+        self, where: Predicate, *, limit: int = 100, skip_vectors: bool = False
+    ) -> list[T]:
+        rows = await self._query_raw(
+            where, limit=limit, include_vectors=not skip_vectors
+        )
         return [self._model_from_milvus(row) for row in rows]
 
     async def find_one_where(self, where: Predicate) -> T | None:
@@ -717,6 +721,7 @@ class MilvusRepoBase[T: BaseModel]:
             )
         )
 
+    @overload
     async def find_by_owner_entries(
         self,
         owner_id: str,
@@ -724,10 +729,43 @@ class MilvusRepoBase[T: BaseModel]:
         *,
         app_id: str = "default",
         project_id: str = "default",
-    ) -> list[T]:
+        columns: None = None,
+        skip_vectors: bool = False,
+    ) -> list[T]: ...
+
+    @overload
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str],
+        skip_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str] | None = None,
+        skip_vectors: bool = False,
+    ) -> list[T] | list[dict[str, Any]]:
         if not entry_ids:
             return []
-        return await self.find_where(
+        if columns is not None and not skip_vectors:
+            # A ``columns`` list that names no vector column cannot need the
+            # vector payload. Milvus charges for that payload on the fetch,
+            # not on the trim below, so decide it here -- otherwise a caller
+            # projecting two scalars still materialises every 1024-D vector
+            # in the result set and discards it one line later.
+            vector_names = {field.name for field in self.index_schema.vector_fields}
+            skip_vectors = not (set(columns) & vector_names)
+        rows = await self.find_where(
             all_of(
                 eq("owner_id", owner_id),
                 one_of("entry_id", list(entry_ids)),
@@ -735,7 +773,14 @@ class MilvusRepoBase[T: BaseModel]:
                 eq("project_id", project_id),
             ),
             limit=len(entry_ids),
+            skip_vectors=skip_vectors,
         )
+        if columns is None:
+            return rows
+        # Milvus has no column projection on the result shape, so the trim to
+        # ``columns`` happens in Python for LanceDB return-shape parity; the
+        # fetch itself was already narrowed above.
+        return [{name: getattr(row, name) for name in columns} for row in rows]
 
     async def find_by_session(
         self, owner_id: str, session_id: str, *, limit: int = 100

@@ -17,7 +17,7 @@ import asyncio
 import datetime as dt
 import re
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import Any, Final, overload
 
 from lancedb.query import BooleanQuery, FullTextQuery, MatchQuery
 
@@ -136,8 +136,12 @@ class LanceIndexContract[T]:
         table = await self._table()
         return await table.count_rows(filter=_render_optional(where))
 
-    async def find_where(self, where: Predicate | str, *, limit: int = 100) -> list[T]:
-        return await super().find_where(_where(where), limit=limit)  # type: ignore[misc]
+    async def find_where(
+        self, where: Predicate | str, *, limit: int = 100, skip_vectors: bool = False
+    ) -> list[T]:
+        return await super().find_where(  # type: ignore[misc]
+            _where(where), limit=limit, skip_vectors=skip_vectors
+        )
 
     async def find_one_where(self, where: Predicate | str) -> T | None:
         return await super().find_one_where(_where(where))  # type: ignore[misc]
@@ -271,6 +275,7 @@ class LanceIndexContract[T]:
             )
         )
 
+    @overload
     async def find_by_owner_entries(
         self,
         owner_id: str,
@@ -278,17 +283,47 @@ class LanceIndexContract[T]:
         *,
         app_id: str = "default",
         project_id: str = "default",
-    ) -> list[T]:
+        columns: None = None,
+        skip_vectors: bool = False,
+    ) -> list[T]: ...
+
+    @overload
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str],
+        skip_vectors: bool = False,
+    ) -> list[dict[str, Any]]: ...
+
+    async def find_by_owner_entries(
+        self,
+        owner_id: str,
+        entry_ids: Sequence[str],
+        *,
+        app_id: str = "default",
+        project_id: str = "default",
+        columns: Sequence[str] | None = None,
+        skip_vectors: bool = False,
+    ) -> list[T] | list[dict[str, Any]]:
         if not entry_ids:
             return []
-        return await self.find_where(
-            all_of(
-                eq("owner_id", owner_id),
-                one_of("entry_id", list(entry_ids)),
-                eq("app_id", app_id),
-                eq("project_id", project_id),
-            ),
-            limit=len(entry_ids),
+        predicate = all_of(
+            eq("owner_id", owner_id),
+            one_of("entry_id", list(entry_ids)),
+            eq("app_id", app_id),
+            eq("project_id", project_id),
+        )
+        if columns is None:
+            return await self.find_where(
+                predicate, limit=len(entry_ids), skip_vectors=skip_vectors
+            )
+        # Column projection keeps the vector payload out of the read.
+        return await self.project_rows(
+            render_predicate(predicate), columns, limit=len(entry_ids)
         )
 
     async def find_by_session(
