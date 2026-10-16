@@ -694,13 +694,18 @@ class SearchManager:
     async def _maxsim_atomic_recall(
         self, req: SearchRequest, where: Predicate, top_k: int
     ) -> list[Candidate]:
-        """MaxSim-style: ANN atomic_facts → max-pool by memcell → batch fetch episodes.
+        """MaxSim-style: ANN atomic_facts → max-pool by episode → batch fetch episodes.
 
         Trades one extra LanceDB ANN scan (over the ~28× denser
         ``atomic_fact`` table) for finer-grained semantic match — long
         episodes whose single mean-pooled vector dilutes a specific topic
         recover via the matching atomic fact's own embedding. Mirrors
         EverOS/EverAlgo's MaxSim retrieval pattern.
+
+        When fact recall yields no parent episode id — no facts in scope
+        because extraction is disabled, not caught up, or failing — falls
+        back to ANN over the episode's own vector instead of returning
+        nothing.
         """
         vector = await self._embed_query(req.query)
         if not vector:
@@ -716,7 +721,16 @@ class SearchManager:
             if fc.score > ep_score.get(pid, -1.0):
                 ep_score[pid] = fc.score
         if not ep_score:
-            return []
+            cands = await self._ep.dense_recall(
+                vector, where, limit=self._recall_limit(req.top_k)
+            )
+            cands = self._apply_radius(cands, _effective_radius(req))
+            logger.info(
+                "vector_recall_fact_pool_empty",
+                owner_id=req.owner_id,
+                hits=len(cands),
+            )
+            return cands
         ranked = sorted(ep_score.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
         top_entry_ids = [eid for eid, _ in ranked]
         score_by_entry = dict(ranked)
